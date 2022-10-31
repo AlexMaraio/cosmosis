@@ -3,7 +3,9 @@ import numpy as np
 from ...output.text_output import TextColumnOutput
 from .. import ParallelSampler
 from ...runtime import LikelihoodPipeline, ClassModule
+import time
 from timeit import default_timer
+
 def task(p, return_all=False):
     # print("Computing data vector for:", p)
     r = sampler.pipeline.run_results(p)
@@ -46,7 +48,9 @@ def task(p, return_all=False):
             raise ValueError("Error and data vectors are different sizes")
         return r.like, data_vectors, error_vectors, r.block
     else:
-        return r.like, data_vectors
+        data_vectors = np.asarray(data_vectors)[0]
+
+        return np.concatenate([np.array([r.like]), data_vectors])
 
 
 def log_probability_function(u, tempering):
@@ -131,27 +135,73 @@ class EmugenSampler(ParallelSampler):
         self.emu_pipeline = None
         self.iterations = 0
 
+        self.full_samples = []
+
+        # The time spent generating the actual data
+        self.time_generating = 0
+
+        # The time spent training the emulator
+        self.time_training = 0
+
+        self.time_emcee = 0
+
+        self.ml_device = 'CPU'
+
+        self.loss_history = []
+
+        self.properties_dict = {
+            'initial_sample': self.initial_size,
+            'resample_size': self.resample_size,
+            'training_iterations': self.training_iterations,
+            'emcee_walkers': self.emcee_walkers,
+            'emcee_samples': self.emcee_samples,
+            'emcee_burn': self.emcee_burn,
+            'tempering': self.tempering
+        }
+
     def generate_initial_sample(self):
+        """
+        Function to generate initial sample points that we will begin our
+        machine learning algorithm on
+        """
         import scipy.stats
 
         print("Generating initial sample")
+
+        # Set up our Latin hypercube of points with the correct number of parameter dimensions
         hypercube = scipy.stats.qmc.LatinHypercube(self.ndim, seed=self.seed)
+
+        # Generate random unit samples from the hypercube
         unit_sample = hypercube.random(n=self.initial_size)
+
+        # Convert our unit value into real values
         sample = np.array(
             [self.pipeline.denormalize_vector_from_prior(p) for p in unit_sample]
         )
 
-        # Generate the likelihood and
+        # Generate the likelihood for our initial set of samples
+        time_generating_start = time.time()
         if self.pool:
             sample_results = self.pool.map(task, sample)
         else:
-            sample_results = list(map(task, sample))
+            sample_results = np.array(list(map(task, sample)))
+
+        # Record this generation time
+        self.time_generating += time.time() - time_generating_start
 
         # useful to save this with the emulator
         # Train our emulator
 
-        sample_likes = np.array([s[0] for s in sample_results if s is not None])
-        sample_data_vectors = np.array([np.concatenate(s[1]) for s in sample_results if s is not None])
+        # print(sample_results)
+
+        # import pdb
+        # pdb.set_trace()
+
+        sample_likes = sample_results[:, 0]
+        sample_data_vectors = sample_results[:, 1:]
+
+        # sample_likes = np.array([s[0] for s in sample_results if s is not None])
+        # sample_data_vectors = np.array([np.concatenate(s[1]) for s in sample_results if s is not None])
         cut = -2 * sample_likes < self.chi2_cut_off
 
         sample_likes = sample_likes[cut]
@@ -163,12 +213,18 @@ class EmugenSampler(ParallelSampler):
         print(f"{n1} initial samples had chi^2 < cut-off ({self.chi2_cut_off})")
 
         self.sample = sample
+
+        self.sample_likes = sample_likes
         self.sample_data_vectors = sample_data_vectors
         self.unit_sample = unit_sample
+
+        self.full_samples.append(self.sample)
 
 
 
     def train_emulator(self):
+        time_training_start = time.time()
+
         from .network3 import NNEmulator
         from .gp import GPEmulator
 
@@ -191,10 +247,16 @@ class EmugenSampler(ParallelSampler):
             n_in, n_out, self.fiducial_data_vector, self.fiducial_errors
         )
 
+        kwargs['batch_size'] = len(self.sample_data_vectors)
+
         emu.train(self.unit_sample, self.sample_data_vectors, **kwargs)
+
+        self.loss_history.append(emu.loss_history)
 
         self.emulator = emu
         self.emu_module.data.set_emulator(emu)
+
+        self.time_training += time.time() - time_training_start
 
 
     def compute_fiducial(self):
@@ -240,16 +302,44 @@ class EmugenSampler(ParallelSampler):
 
         print(f"Running real pipeline on new sample")
         # Generate the likelihood and data vectors for the new sample
+        time_generating_start = time.time()
         if self.pool:
             sample_results = self.pool.map(task, sample)
         else:
-            sample_results = list(map(task, sample))
+            sample_results = np.array(list(map(task, sample)))
+
+        # Add this time to the class
+        self.time_generating += time.time() - time_generating_start
 
         # append the results of the mcmc to the current sample
-        sample_data_vectors = np.array([np.concatenate(s[1]) for s in sample_results if s is not None])
+        # import pdb
+        # pdb.set_trace()
+
+        # sample_likes = np.array([np.concatenate(s[0]) for s in sample_results if s is not None])
+        # sample_data_vectors = np.array([np.concatenate(s[1]) for s in sample_results if s is not None])
+
+        sample_likes = sample_results[:, 0]
+        sample_data_vectors = sample_results[:, 1:]
+
+        self.sample_likes = np.append(self.sample_likes, sample_likes, axis=0)
         self.sample = np.append(self.sample, sample, axis=0)
         self.sample_data_vectors = np.append(self.sample_data_vectors, sample_data_vectors, axis=0)
         self.unit_sample = np.append(self.unit_sample, unit_sample, axis=0)
+
+        # import pdb
+        # pdb.set_trace()
+
+        # Remove low likelihood samples
+        likelihood_sort_idx = np.argsort(self.sample_likes)[::-1]
+
+        bottom_25_idx = int(0.25 * len(self.sample_likes))
+
+        self.sample = self.sample[likelihood_sort_idx][bottom_25_idx:]
+        self.sample_likes = self.sample_likes[likelihood_sort_idx][bottom_25_idx:]
+        self.sample_data_vectors = self.sample_data_vectors[likelihood_sort_idx][bottom_25_idx:]
+        self.unit_sample = self.unit_sample[likelihood_sort_idx][bottom_25_idx:]
+
+        self.full_samples.append(sample)
 
     def get_emcee_start(self):
         # TODO: improve by removing low likelihood samples here
@@ -258,6 +348,8 @@ class EmugenSampler(ParallelSampler):
         return self.unit_sample[-self.emcee_walkers:]        
 
     def execute(self):
+        # This is the main function that generates the actual data and trains the ML algorithm
+
         import emcee
         if self.iterations == 0:
             self.compute_fiducial()
@@ -276,6 +368,8 @@ class EmugenSampler(ParallelSampler):
         else:
             print(f"Running final emcee without tempering - iteration {self.iterations}")
             tempering = 1
+
+        time_emcee_start = time.time()
 
         # run an mcmc using the current sample
         sampler = emcee.EnsembleSampler(
@@ -315,7 +409,7 @@ class EmugenSampler(ParallelSampler):
             post = tempered_post / tempering
             self.output.parameters(params, extra, prior, tempered_post, post)
 
-
+        self.time_emcee += time.time() - time_emcee_start
 
         # Iterate more!
         self.iterations += 1

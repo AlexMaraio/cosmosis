@@ -135,6 +135,8 @@ class NNEmulator:
                 y_pred = self.model(X_batch)
                 loss = torch.mean(torch.abs(y_batch - y_pred))
                 losses.append(loss)
+                self.loss_history.append(float(loss))
+
                 self.optim.zero_grad()
                 loss.backward()
                 self.optim.step()
