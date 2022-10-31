@@ -44,13 +44,17 @@ class ResBlock(nn.Module):
     
 class NNEmulator:
     def __init__(self, N_DIM, OUTPUT_DIM, dv_fid, dv_std, model=None, optim=None, device='cpu'):
+    # def __init__(self, N_DIM, OUTPUT_DIM, dv_fid, dv_std, model=None, optim=None, device='cuda'):
         self.N_DIM = N_DIM
         self.model = model
         self.optim = optim
         self.device = device
         self.trained = False
-        self.dv_fid = torch.Tensor(dv_fid)
-        self.dv_std = torch.Tensor(dv_std)
+        self.dv_fid = torch.tensor(dv_fid)
+        self.dv_std = torch.tensor(dv_std)
+
+        # The loss history
+        self.loss_history = []
         
         if model is None:
             self.model = nn.Sequential(
@@ -85,6 +89,7 @@ class NNEmulator:
                     Affine()
                 )
 
+        # self.model = nn.DataParallel(self.model)
         self.model.to(device)
 
         if self.optim is None:
@@ -102,15 +107,16 @@ class NNEmulator:
         return self.pca.inverse_transform(pca_coeff)
     
     def train(self, X, y, test_split=None, batch_size=32, n_epochs=100):
-        X = torch.Tensor(X)
-        y = torch.Tensor(y)
+        # Convert our training data set to tensors on the appropriate device using the correct dtype
+        X = torch.tensor(X, device=self.device, dtype=torch.float32)
+        y = torch.tensor(y, device=self.device, dtype=torch.float32)
+
         if not self.trained:
-            self.X_mean = torch.Tensor(X.mean(axis=0, keepdims=True))
-            self.X_std  = torch.Tensor(X.std(axis=0, keepdims=True))
-            # self.y_mean = self.dv_fid
-            # self.y_std  = self.dv_std
-            self.y_mean = torch.Tensor(y.mean(axis=0, keepdims=True))
-            self.y_std  = torch.Tensor(y.std(axis=0, keepdims=True))
+            self.X_mean = X.mean(axis=0, keepdims=True).clone().detach()
+            self.X_std  = X.std(axis=0, keepdims=True).clone().detach()
+            
+            self.y_mean = y.mean(axis=0, keepdims=True).clone().detach()
+            self.y_std = y.std(axis=0, keepdims=True).clone().detach()
 
 
         X_train = (X - self.X_mean) / self.X_std
@@ -140,15 +146,12 @@ class NNEmulator:
         assert self.trained, "The emulator needs to be trained first before predicting"
 
         with torch.no_grad():
-            X_mean = self.X_mean.clone().detach()
-            X_std  = self.X_std.clone().detach()
-
-            X_norm = (X - X_mean) / X_std
-            y_pred = self.model.eval()(X_norm).cpu()
+            X_norm = (X.to(self.device) - self.X_mean) / self.X_std
+            y_pred = self.model.eval()(X_norm)
             
         y_pred = y_pred * self.y_std + self.y_mean
 
-        return y_pred.numpy()
+        return y_pred.detach().cpu().numpy()
 
     def save(self, filename):
         torch.save(self.model, filename)
@@ -164,9 +167,9 @@ class NNEmulator:
         self.trained = True
         self.model = torch.load(filename)
         with h5.File(filename + '.h5', 'r') as f:
-            self.X_mean = torch.Tensor(f['X_mean'][:])
-            self.X_std  = torch.Tensor(f['X_std'][:])
-            self.y_mean = torch.Tensor(f['Y_mean'][:])
-            self.y_std  = torch.Tensor(f['Y_std'][:])
-            self.dv_fid = torch.Tensor(f['dv_fid'][:])
-            self.dv_std = torch.Tensor(f['dv_std'][:])
+            self.X_mean = torch.tensor(f['X_mean'][:])
+            self.X_std  = torch.tensor(f['X_std'][:])
+            self.y_mean = torch.tensor(f['Y_mean'][:])
+            self.y_std  = torch.tensor(f['Y_std'][:])
+            self.dv_fid = torch.tensor(f['dv_fid'][:])
+            self.dv_std = torch.tensor(f['dv_std'][:])
